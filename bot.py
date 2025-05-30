@@ -139,28 +139,24 @@ else:
 def run_bot() -> None:
     logging.basicConfig(level=logging.INFO,
                         format="%(levelname)s:%(name)s:%(message)s")
-    token = os.getenv("TG_BOT_TOKEN")
-    if not token:
-        sys.exit("ERROR: set TG_BOT_TOKEN")
 
-    if PTB_MODE == "async":         
+    token = os.getenv("TG_BOT_TOKEN") or sys.exit("Set TG_BOT_TOKEN")
+
+    if PTB_MODE == "async":           
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)      
+
         app = (ApplicationBuilder()
                .token(token)
                .concurrent_updates(True)
                .build())
         app.add_handler(CommandHandler("start", h_start))
         app.add_handler(CommandHandler("clip",  h_clip))
-        logging.info("Bot (async) online.")
-        app.run_polling(drop_pending_updates=True, close_loop=False)
 
-    else:                          
-        updater = Updater(token)
-        dp = updater.dispatcher
-        dp.add_handler(CommandHandler("start", h_start))
-        dp.add_handler(CommandHandler("clip",  h_clip))
-        logging.info("Bot (sync) online.")
-        updater.start_polling(drop_pending_updates=True)
-        updater.idle(stop_signals=())         
+        logging.info("Bot (async) online.")
+        app.run_polling(drop_pending_updates=True)   
+        
 
 
 st.set_page_config(page_title="YouTube Clip Bot", page_icon="🎬")
