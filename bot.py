@@ -1,180 +1,128 @@
-import asyncio
-import logging
-import os
-import re
-import subprocess
-import tempfile
-import threading
-from concurrent.futures import ThreadPoolExecutor
+import logging, os, re, subprocess, tempfile, threading
 from datetime import timedelta
 from pathlib import Path
+
 
 import streamlit as st
 import yt_dlp
 from imageio_ffmpeg import get_ffmpeg_exe
 from telegram import Update
-from telegram.constants import ChatAction
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from telegram.error import TimedOut
+from telegram.ext import Updater, CommandHandler, CallbackContext
 
 FFMPEG_BIN = get_ffmpeg_exe()
-EXECUTOR   = ThreadPoolExecutor(max_workers=os.cpu_count() or 2)
-TIMEOUTS   = dict(
-    read_timeout=120,
-    write_timeout=120,
-    connect_timeout=120,
-    pool_timeout=120,
-)
 CLIP_RE = re.compile(
     r"^\s*(?P<url>https?://\S+)\s+"
     r"(?P<t1>\d+(?::\d{1,2}){0,2})\s+"
     r"(?P<t2>\d+(?::\d{1,2}){0,2})\s*$"
 )
 
-def _hms_to_sec(ts: str) -> int:
-    parts = [int(x) for x in ts.split(":")]
-    while len(parts) < 3:
-        parts.insert(0, 0)
-    h, m, s = parts
+
+def hms_to_sec(ts: str) -> int:
+    p = [int(x) for x in ts.split(":")]
+    while len(p) < 3: p.insert(0, 0)
+    h, m, s = p
     return h * 3600 + m * 60 + s
 
 
-async def _clip(url: str, t1: str, t2: str, outfile: Path) -> None:
-    """Download *url*, cut [t1,t2) into *outfile* with ffmpeg."""
-    loop = asyncio.get_running_loop()
-
-    info = await loop.run_in_executor(
-        EXECUTOR,
-        lambda: yt_dlp.YoutubeDL(
-            {"quiet": True,
-             "skip_download": True,
-             "format": "best[ext=mp4][vcodec!*=av01]/best[ext=mp4]/best"}
-        ).extract_info(url, download=False)
-    )
+def clip_youtube(url: str, t1: str, t2: str, out: Path) -> None:
+    ydl = yt_dlp.YoutubeDL({
+        "quiet": True,
+        "skip_download": True,
+        "format": "best[ext=mp4][vcodec!*=av01]/best[ext=mp4]/best",
+    })
+    info = ydl.extract_info(url, download=False)
     stream_url = info.get(
         "url",
-        next(
-            f["url"]
-            for f in info["formats"]
-            if f.get("ext") == "mp4" and f.get("acodec") != "none"
-        ),
+        next(f["url"] for f in info["formats"]
+             if f.get("ext") == "mp4" and f.get("acodec") != "none")
     )
 
-    s0, s1 = _hms_to_sec(t1), _hms_to_sec(t2)
-    if s1 <= s0:
-        raise ValueError("end timestamp must be later than start timestamp")
-    duration = s1 - s0
+    s0, s1 = hms_to_sec(t1), hms_to_sec(t2)
+    if s1 <= s0: raise ValueError("end ≤ start")
+    dur = s1 - s0
 
-    cmd = [
-        FFMPEG_BIN,
-        "-hide_banner", "-loglevel", "error",
-        "-ss", str(timedelta(seconds=s0)),
-        "-i", stream_url,
-        "-t", str(duration),
-        "-c", "copy",
-        "-avoid_negative_ts", "make_zero",
-        str(outfile),
-    ]
-    await loop.run_in_executor(EXECUTOR, lambda: subprocess.run(cmd, check=True))
+    cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error",
+           "-ss", str(timedelta(seconds=s0)), "-i", stream_url,
+           "-t", str(dur), "-c", "copy", "-avoid_negative_ts", "make_zero",
+           str(out)]
+    subprocess.run(cmd, check=True)
 
 
-async def clip_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """/clip <url> <start> <end>"""
-    if not ctx.args or len(ctx.args) < 3:
-        await update.message.reply_text(
+def h_start(upd: Update, _: CallbackContext) -> None:
+    upd.message.reply_text(
+        "Hi! Send /clip <url> <start> <end> and I'll return the snippet.\n"
+        "Example:\n/clip https://youtu.be/dQw4w9WgXcQ 0:30 1:00"
+    )
+
+def h_clip(upd: Update, _: CallbackContext) -> None:
+    if not upd.message or not upd.message.text: return
+    args = upd.message.text.split(maxsplit=3)[1:]
+    if len(args) < 3:
+        upd.message.reply_text(
             "Usage:\n/clip <YouTube-URL> <start> <end>\n"
-            "Example: /clip https://youtu.be/ESXOAJRdcwQ 0:30 1:15"
-        )
-        return
-
-    m = CLIP_RE.match(" ".join(ctx.args))
+            "Example: /clip https://youtu.be/abc123 0:30 1:15"
+        ); return
+    m = CLIP_RE.match(" ".join(args))
     if not m:
-        await update.message.reply_text("Couldn’t parse that 🤔")
-        return
-
+        upd.message.reply_text("Couldn’t parse that 🤔"); return
     url, t1, t2 = m["url"], m["t1"], m["t2"]
-    note = await update.message.reply_text("⏳ Clipping…")
-    await ctx.bot.send_chat_action(chat_id=update.effective_chat.id,
-                                   action=ChatAction.UPLOAD_VIDEO)
+    note = upd.message.reply_text("⏳ Clipping…")
 
     try:
         with tempfile.TemporaryDirectory() as td:
-            clip_path = Path(td) / "clip.mp4"
-            await _clip(url, t1, t2, clip_path)
-
-            try:
-                await update.message.reply_video(
-                    video=clip_path.open("rb"),
-                    supports_streaming=True,
-                    caption=f"[{t1}–{t2}] of {url}",
-                    **TIMEOUTS,
-                )
-            except TimedOut:
-                logging.warning("Telegram upload still running (TimedOut)")
+            clip_path = Path(td)/"clip.mp4"
+            clip_youtube(url, t1, t2, clip_path)
+            upd.message.reply_video(
+                video=clip_path.open("rb"), supports_streaming=True,
+                caption=f"[{t1}–{t2}] of {url}")
     except Exception as e:
         logging.exception("clip error")
-        await note.edit_text(f"⚠️ Failed: {e}")
+        note.edit_text(f"⚠️ Failed: {e}")
     else:
-        await note.delete()
+        note.delete()
 
 
-async def start_command(update: Update, _):
-    await update.message.reply_text(
-        "Hi! Send /clip <url> <start> <end> and I’ll return your snippet. Example: /clip https://www.youtube.com/watch?v=lNGFAI7R0PE 00:00:30 00:01:15"
-    )
-
-
-def bot_thread():
-    asyncio.set_event_loop(asyncio.new_event_loop())
-    token = os.environ.get("TG_BOT_TOKEN")
+def run_bot() -> None:
+    logging.basicConfig(level=logging.INFO,
+                        format="%(levelname)s:%(name)s:%(message)s")
+    token = os.getenv("TG_BOT_TOKEN")
     if not token:
-        raise RuntimeError("Set TG_BOT_TOKEN environment variable")
+        raise RuntimeError("Set TG_BOT_TOKEN env var")
 
-    app = (
-        ApplicationBuilder()
-        .token(token)
-        .concurrent_updates(True)
-        .read_timeout(120).write_timeout(120)
-        .connect_timeout(120).pool_timeout(120)
-        .build()
-    )
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("clip",  clip_command))
+    updater = Updater(token)               
+    dp = updater.dispatcher
+    dp.add_handler(CommandHandler("start", h_start))
+    dp.add_handler(CommandHandler("clip",  h_clip))
 
-    logging.info("Telegram bot started (background thread)")
-    app.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=["message"],
-        stop_signals=None,     
-        close_loop=False,         
-    )
-
-
+    logging.info("Bot thread online.")
+    updater.start_polling(drop_pending_updates=True)
+    updater.idle(stop_signals=())  
 
 
 st.set_page_config(page_title="YouTube Clip Bot", page_icon="🎬")
+
+@st.cache_resource
+def launch_bot_once() -> threading.Thread:
+    t = threading.Thread(target=run_bot, daemon=True)
+    t.start()
+    return t
+
+launch_bot_once()                 
+
 st.title("🎬 YouTube Clip Bot for Telegram")
+st.success("Bot is running in the background.  Open Telegram and talk to it!")
 
 st.write(
     """
-Talk to your Telegram bot and send a command like:
-/clip https://youtu.be/ESXOAJRdcwQ 0:30 1:15
+Send:
 
-The bot will reply with the trimmed MP4.
+/clip https://youtu.be/dQw4w9WgXcQ 0:30 1:00
+and the bot will reply with the trimmed MP4 clip.
 """
 )
 
-
-if "bot_started" not in st.session_state:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(levelname)s:%(name)s:%(message)s",
-    )
-    threading.Thread(target=bot_thread, daemon=True).start()
-    st.session_state.bot_started = True
-    st.success("Background Telegram bot started")
-
 st.caption(
-    "This page just keeps the bot alive. "
-    "You may close the tab—Streamlit will continue running."
+    "You may close this tab; Streamlit will keep the bot alive on the server."
 )
+
+
