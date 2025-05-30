@@ -1,0 +1,4 @@
+python-telegram-bot[ext]==21.1        
+yt-dlp==2024.12.18                   
+imageio[ffmpeg]==2.34.0
+
