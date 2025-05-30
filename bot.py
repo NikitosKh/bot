@@ -155,7 +155,13 @@ def run_bot() -> None:
         app.add_handler(CommandHandler("clip",  h_clip))
 
         logging.info("Bot (async) online.")
-        app.run_polling(drop_pending_updates=True)   
+        # in run_bot() – async branch
+        app.run_polling(
+            drop_pending_updates=True,
+            stop_signals=[],       
+            close_loop=False        
+        )
+  
         
 
 
