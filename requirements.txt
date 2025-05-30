@@ -1,4 +1,4 @@
-python-telegram-bot
-yt-dlp                 
+python-telegram-bot[ext]
+yt-dlp
 imageio[ffmpeg]
-
+nest_asyncio   
